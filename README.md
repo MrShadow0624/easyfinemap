@@ -36,3 +36,19 @@ A flexible framework for GWAS fine-mapping
     * FINEMAP
     * CAVIARBF
     * PAINTOR -->
+
+## Fork-specific SuSiE-RSS behavior
+
+This fork adds two SuSiE-RSS compatibility changes for research workflows:
+
+1. `--sample-size` is optional for SuSiE-RSS. If omitted, the underlying
+   `susieR::susie_rss()` call omits the `n` argument (the official no-N
+   path in the fork's pinned susieR 0.12.35); if supplied, the numerical
+   sample size is passed through.
+2. SuSiE credible sets are taken from native, effect-specific
+   `susie_get_cs()` output (including coverage and LD-purity summaries),
+   rather than being reconstructed by cumulatively summing marginal PIPs
+   across a locus.
+
+Implementation notes and references are documented in
+[`docs/susie_native_cs.md`](docs/susie_native_cs.md).

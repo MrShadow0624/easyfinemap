@@ -148,7 +148,13 @@ def fine_mapping(
     conditional: bool = typer.Option(False, "--conditional", "-c", help="Whether to use conditional mode."),
     prior_file: Optional[str] = typer.Option(None, "--prior-file", help="The path to the prior file."),
     sample_size: Optional[int] = typer.Option(
-        None, "--sample-size", "-n", help="The sample size for conditional mode."
+        None,
+        "--sample-size",
+        "-n",
+        help=(
+            "Sample size. Optional for SuSiE-RSS (omitted => n=NULL); "
+            "required for FINEMAP and conditional analysis."
+        ),
     ),
     ldref: str = typer.Option(None, "--ldref", help="The path to the LD reference file."),
     cond_snps_wind_kb: int = typer.Option(
@@ -158,6 +164,11 @@ def fine_mapping(
     credible_threshold: Optional[float] = typer.Option(None, "--credible-threshold", help="The credible threshold."),
     credible_method: Optional[str] = typer.Option(
         None, "--credible-method", help="The fine-mapping method for credible set."
+    ),
+    susie_min_abs_corr: float = typer.Option(
+        0.5,
+        "--susie-min-abs-corr",
+        help="Minimum absolute within-set LD correlation for native SuSiE credible sets.",
     ),
     use_ref_EAF: bool = typer.Option(False, "--use-ref-eaf", help="Whether to use the reference panel EAF."),
     threads: int = typer.Option(1, "--threads", "-t", help="The number of threads."),
@@ -182,6 +193,7 @@ def fine_mapping(
             max_causal=max_causal,
             credible_threshold=credible_threshold,
             credible_method=credible_method,
+            susie_min_abs_corr=susie_min_abs_corr,
             use_ref_EAF=use_ref_EAF,
             threads=threads,
         )

@@ -20,7 +20,7 @@ import logging
 import os
 from pathlib import Path
 from subprocess import PIPE, run
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
 from multiprocessing import Pool
 from tqdm import tqdm
 
@@ -383,37 +383,77 @@ class EasyFinemap(object):
             caviar_res = pd.Series(caviar_res[1].values, index=caviar_input[ColName.SNPID].tolist())
             return caviar_res
 
+    @staticmethod
+    def _format_susie_n_clause(sample_size: Optional[int]) -> str:
+        """Format the optional sample-size clause for susie_rss.
+
+        EasyFinemap pins susieR 0.12.35, where the official no-N mode is
+        activated by omitting the n argument. Newer susieR interfaces also
+        describe n as optional. Returning an empty clause therefore preserves
+        the official no-N behavior across versions.
+        """
+        if sample_size is None:
+            return ""
+        if sample_size <= 0:
+            raise ValueError("sample_size must be positive or None for SuSiE-RSS.")
+        return f"n={int(round(sample_size))},"
+
     @io_in_tempdir('./tmp/easyfinemap')
     def run_susie(
         self,
         sumstats: pd.DataFrame,
         ld_matrix: str,
-        sample_size: int,
+        sample_size: Optional[int] = None,
         max_causal: int = 1,
         prior_file: Optional[str] = None,
         temp_dir: Optional[str] = None,
+        return_native_cs: bool = False,
         **kwargs,
-    ) -> pd.Series:
-        """
-        Run SuSiE.
+    ) -> Union[pd.Series, Tuple[pd.Series, pd.DataFrame, pd.DataFrame]]:
+        """Run SuSiE-RSS and optionally return native per-effect credible sets.
 
         Parameters
         ----------
         sumstats : pd.DataFrame
             Summary statistics.
         ld_matrix : str
-            Path to LD matrix.
-        sample_size : int
-            Sample size.
+            Path to signed LD correlation matrix.
+        sample_size : Optional[int], optional
+            Sample size supplied to susie_rss. When omitted, the n argument
+            is omitted from the R call, activating SuSiE-RSS no-N mode. This
+            is equivalent in intent to n = NULL in newer optional-n interfaces
+            and is compatible with the fork's pinned susieR 0.12.35.
         max_causal : int, optional
-            Maximum number of causal variants, by default 1
+            Maximum number of single effects (L), by default 1.
         prior_file : Optional[str], optional
-            Path to prior file, by default None
+            Path to PolyFun prior file, by default None.
+        return_native_cs : bool, optional
+            If True, also return SuSiE native per-effect credible-set
+            membership and credible-set summaries.
 
-        Returns
-        -------
-        pd.Series
-            The result of SuSiE.
+        Notes
+        -----
+        SuSiE credible sets are defined from the effect-specific posterior
+        inclusion probabilities in res$alpha and returned by
+        susieR::susie_get_cs. They are not reconstructed by cumulatively
+        summing marginal PIPs across the whole locus.
+
+        This follows the SuSiE reference implementation and the HERMES2
+        PolyFun/SuSiE workflow, where PolyFun reads native susie_obj$sets
+        and propagates those memberships as CREDIBLE_SET.
+
+        References
+        ----------
+        SuSiE-RSS:
+        https://stephenslab.github.io/susieR/reference/susie_rss.html
+        susieR 0.12.35 no-N implementation used by EasyFinemap's environment:
+        https://github.com/stephenslab/susieR/blob/da24d5fba95845ad082b893f9c80b85b7523c6f6/R/susie_rss.R
+        SuSiE native credible sets:
+        https://github.com/stephenslab/susieR/blob/master/R/susie_get_functions.R
+        HERMES2 fine-mapping wrapper:
+        https://github.com/ihi-comp-med/hermes2-gwas/blob/486fbcf9ace1c09135bce982f6e6ad7ae67178b7/workflow/rules/scripts/finemap/run_polyfun_susie.py
+        PolyFun SuSiE credible-set extraction used by the HERMES workflow:
+        https://github.com/omerwe/polyfun/blob/7227ed5261ee0ed9ad1af1031419a2180099b953/finemapper.py
         """
         susie_input = sumstats.copy()
         susie_input[ColName.Z] = susie_input[ColName.BETA] / susie_input[ColName.SE]
@@ -421,30 +461,150 @@ class EasyFinemap(object):
             susie_input['SNPVAR'] = susie_input['SNPVAR'] / susie_input['SNPVAR'].sum()
         else:
             susie_input['SNPVAR'] = 1 / len(susie_input)
+
+        coverage = kwargs.get("credible_threshold")
+        if coverage is None:
+            coverage = 0.95
+        min_abs_corr = kwargs.get("susie_min_abs_corr", 0.5)
+        if not 0 < coverage <= 1:
+            raise ValueError("credible_threshold must be in (0, 1].")
+        if not 0 <= min_abs_corr <= 1:
+            raise ValueError("susie_min_abs_corr must be in [0, 1].")
+
         susie_input[[ColName.SNPID, ColName.Z, 'SNPVAR']].to_csv(
             f"{temp_dir}/susie.input", sep=" ", index=False, header=True
         )
-        self.logger.debug(f"run SuSiE: {temp_dir}/susie.input, prior_file: {prior_file}")
+        self.logger.debug(
+            f"run SuSiE: {temp_dir}/susie.input, prior_file: {prior_file}, "
+            f"sample_size: {sample_size}, coverage: {coverage}, "
+            f"min_abs_corr: {min_abs_corr}"
+        )
 
         import rpy2.robjects as ro
         from rpy2.rinterface_lib.callbacks import logger as rpy2_logger
 
         rpy2_logger.setLevel(logging.ERROR)
+        n_clause = self._format_susie_n_clause(sample_size)
 
         ro.r(
-            f'''library('data.table')
+            f"""library('data.table')
                 ld = fread('{ld_matrix}', sep=' ', header=FALSE)
                 ld = as.matrix(ld)
                 df = fread('{temp_dir}/susie.input', sep=' ', header=TRUE)
                 z = df$Z
                 prior = df$SNPVAR
                 library('susieR')
-                res = susie_rss(z, ld, n={sample_size}, L = {max_causal}, prior_weights = prior)
-                pip = res$pip'''
+                res = susie_rss(
+                    z,
+                    ld,
+                    {n_clause}
+                    L={max_causal},
+                    prior_weights=prior,
+                    coverage={coverage},
+                    min_abs_corr={min_abs_corr}
+                )
+                pip = res$pip
+
+                sets = susie_get_cs(
+                    res,
+                    Xcorr=ld,
+                    coverage={coverage},
+                    min_abs_corr={min_abs_corr}
+                )
+
+                cs_members = data.table(
+                    SNPID=character(),
+                    SUSIE_EFFECT=integer(),
+                    SUSIE_CS=character(),
+                    SUSIE_ALPHA=numeric(),
+                    SUSIE_CUM_ALPHA=numeric()
+                )
+                cs_summary = data.table(
+                    SUSIE_EFFECT=integer(),
+                    SUSIE_CS=character(),
+                    SUSIE_COVERAGE=numeric(),
+                    SUSIE_CS_SIZE=integer(),
+                    SUSIE_MIN_ABS_CORR=numeric(),
+                    SUSIE_MEAN_ABS_CORR=numeric(),
+                    SUSIE_MEDIAN_ABS_CORR=numeric()
+                )
+
+                if (!is.null(sets$cs)) {{
+                    for (k in seq_along(sets$cs)) {{
+                        idx = sets$cs[[k]]
+                        effect_idx = if (!is.null(sets$cs_index)) sets$cs_index[[k]] else k
+                        alpha_values = res$alpha[effect_idx, idx]
+                        ord = order(alpha_values, decreasing=TRUE)
+                        idx = idx[ord]
+                        alpha_values = alpha_values[ord]
+
+                        cs_name = names(sets$cs)[k]
+                        if (is.null(cs_name) || is.na(cs_name) || cs_name == "") {{
+                            cs_name = paste0("L", effect_idx)
+                        }}
+
+                        cs_members = rbind(
+                            cs_members,
+                            data.table(
+                                SNPID=df$SNPID[idx],
+                                SUSIE_EFFECT=as.integer(effect_idx),
+                                SUSIE_CS=cs_name,
+                                SUSIE_ALPHA=as.numeric(alpha_values),
+                                SUSIE_CUM_ALPHA=cumsum(as.numeric(alpha_values))
+                            )
+                        )
+
+                        purity_vals = c(NA_real_, NA_real_, NA_real_)
+                        if (!is.null(sets$purity) && nrow(sets$purity) >= k) {{
+                            purity_vals = as.numeric(sets$purity[k, 1:3])
+                        }}
+                        claimed_coverage = if (!is.null(sets$coverage)) {{
+                            as.numeric(sets$coverage[[k]])
+                        }} else {{
+                            sum(alpha_values)
+                        }}
+
+                        cs_summary = rbind(
+                            cs_summary,
+                            data.table(
+                                SUSIE_EFFECT=as.integer(effect_idx),
+                                SUSIE_CS=cs_name,
+                                SUSIE_COVERAGE=claimed_coverage,
+                                SUSIE_CS_SIZE=length(idx),
+                                SUSIE_MIN_ABS_CORR=purity_vals[1],
+                                SUSIE_MEAN_ABS_CORR=purity_vals[2],
+                                SUSIE_MEDIAN_ABS_CORR=purity_vals[3]
+                            )
+                        )
+                    }}
+                }}
+
+                fwrite(
+                    cs_members,
+                    '{temp_dir}/susie.cs_members.tsv',
+                    sep='\\t',
+                    quote=FALSE
+                )
+                fwrite(
+                    cs_summary,
+                    '{temp_dir}/susie.cs_summary.tsv',
+                    sep='\\t',
+                    quote=FALSE
+                )"""
         )
+
         susie_input['pip'] = ro.r('pip')
-        susie_res = pd.Series(susie_input['pip'].values, index=susie_input[ColName.SNPID].tolist())
-        return susie_res
+        susie_res = pd.Series(
+            susie_input['pip'].values,
+            index=susie_input[ColName.SNPID].tolist(),
+        )
+
+        if not return_native_cs:
+            return susie_res
+
+        cs_members = pd.read_csv(f"{temp_dir}/susie.cs_members.tsv", sep="\t")
+        cs_summary = pd.read_csv(f"{temp_dir}/susie.cs_summary.tsv", sep="\t")
+        return susie_res, cs_members, cs_summary
 
     @io_in_tempdir('./tmp/easyfinemap')
     def cond_sumstat(
@@ -586,6 +746,11 @@ class EasyFinemap(object):
         if credible_threshold is None:
             return finemap_res
         else:
+            if credible_method in {"susie", "polyfun_susie"}:
+                raise ValueError(
+                    "SuSiE credible sets must use native effect-specific "
+                    "susie_get_cs output; they are handled in finemap_locus."
+                )
             credible_threshold = credible_threshold * max_causal
             if credible_method:
                 pp_col = f"PP_{credible_method.upper()}"
@@ -599,6 +764,30 @@ class EasyFinemap(object):
                     "Must specify credible set method when credible threshold is specified"
                 )
         return credible_set.reset_index(drop=True)
+
+    @staticmethod
+    def _merge_susie_native_cs(
+        finemap_res: pd.DataFrame,
+        cs_members: pd.DataFrame,
+        cs_summary: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Merge native SuSiE credible-set memberships onto variant results.
+
+        The membership table is intentionally long-format: a variant may occur
+        in more than one effect-specific credible set, so duplicate SNP rows are
+        preserved when that occurs.
+        """
+        if cs_members.empty:
+            return finemap_res.iloc[0:0].copy()
+
+        out = finemap_res.merge(cs_members, on=ColName.SNPID, how="inner")
+        if not cs_summary.empty:
+            out = out.merge(
+                cs_summary,
+                on=["SUSIE_EFFECT", "SUSIE_CS"],
+                how="left",
+            )
+        return out.reset_index(drop=True)
 
     def annotate_prior(
         self,
@@ -749,6 +938,7 @@ class EasyFinemap(object):
             )
         # if os.path.exists(f"{temp_dir}/intersc.ld"):
         #     fm_input_ol = ld_ol.copy()
+        susie_native = {}
         for method in methods:
             if method == "abf":
                 abf_pp = self.run_abf(sumstats=fm_input_ol, **kwargs)
@@ -788,10 +978,15 @@ class EasyFinemap(object):
                         out_sumstats[ColName.PP_CAVIARBF] = np.nan
                 elif method == "susie":
                     if os.path.exists(ld_matrix):
-                        susie_pp = self.run_susie(
-                            sumstats=ld_ol, ld_matrix=ld_matrix, prior_file=None, **kwargs
+                        susie_pp, susie_cs_members, susie_cs_summary = self.run_susie(
+                            sumstats=ld_ol,
+                            ld_matrix=ld_matrix,
+                            prior_file=None,
+                            return_native_cs=True,
+                            **kwargs,
                         )
                         out_sumstats[ColName.PP_SUSIE] = out_sumstats[ColName.SNPID].map(susie_pp)
+                        susie_native["susie"] = (susie_cs_members, susie_cs_summary)
                     else:
                         self.logger.warning(f"LD matrix {ld_matrix} does not exist, skip {method}")
                         out_sumstats[ColName.PP_SUSIE] = np.nan
@@ -808,11 +1003,19 @@ class EasyFinemap(object):
                         out_sumstats[ColName.PP_POLYFUN_FINEMAP] = np.nan
                 elif method == "polyfun_susie":
                     if os.path.exists(ld_matrix):
-                        polyfun_susie_pp = self.run_susie(
-                            sumstats=ld_ol, ld_matrix=ld_matrix, prior_file=prior_file, **kwargs
+                        polyfun_susie_pp, susie_cs_members, susie_cs_summary = self.run_susie(
+                            sumstats=ld_ol,
+                            ld_matrix=ld_matrix,
+                            prior_file=prior_file,
+                            return_native_cs=True,
+                            **kwargs,
                         )
                         out_sumstats[ColName.PP_POLYFUN_SUSIE] = out_sumstats[ColName.SNPID].map(
                             polyfun_susie_pp
+                        )
+                        susie_native["polyfun_susie"] = (
+                            susie_cs_members,
+                            susie_cs_summary,
                         )
                     else:
                         self.logger.warning(f"LD matrix {ld_matrix} does not exist, skip {method}")
@@ -820,7 +1023,25 @@ class EasyFinemap(object):
             else:
                 raise ValueError(f"Method {method} is not supported")
 
-        credible_set = self.get_credset(finemap_res=out_sumstats, **kwargs)
+        credible_threshold = kwargs.get("credible_threshold")
+        credible_method = kwargs.get("credible_method")
+        if (
+            credible_threshold is not None
+            and credible_method in {"susie", "polyfun_susie"}
+        ):
+            if credible_method not in susie_native:
+                raise ValueError(
+                    f"Native SuSiE credible sets requested for {credible_method}, "
+                    "but that method was not run successfully."
+                )
+            cs_members, cs_summary = susie_native[credible_method]
+            credible_set = self._merge_susie_native_cs(
+                out_sumstats,
+                cs_members,
+                cs_summary,
+            )
+        else:
+            credible_set = self.get_credset(finemap_res=out_sumstats, **kwargs)
         credible_set[ColName.LEAD_SNP] = lead_snp
         return credible_set
 
@@ -855,6 +1076,7 @@ class EasyFinemap(object):
         max_causal: int = 1,
         credible_threshold: Optional[float] = None,
         credible_method: Optional[str] = None,
+        susie_min_abs_corr: float = 0.5,
         use_ref_EAF: bool = False,
         outfile: Optional[str] = None,
         threads: int = 1,
@@ -890,6 +1112,9 @@ class EasyFinemap(object):
             Credible threshold, by default None
         credible_method : Optional[str], optional
             Credible method, by default None
+        susie_min_abs_corr : float, optional
+            Minimum absolute within-set correlation for native SuSiE credible
+            sets, by default 0.5 (the susieR default).
         use_ref_EAF : bool, optional
             Use reference EAF, by default False
         outfile : Optional[str], optional
@@ -926,6 +1151,7 @@ class EasyFinemap(object):
                 "max_causal": max_causal,
                 "credible_threshold": credible_threshold,
                 "credible_method": credible_method,
+                "susie_min_abs_corr": susie_min_abs_corr,
                 "use_ref_EAF": use_ref_EAF,
             }
             kwargs_list.append(kwargs)
