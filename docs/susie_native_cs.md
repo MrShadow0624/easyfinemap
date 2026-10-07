@@ -10,6 +10,21 @@ In this release `missing(n)` selects the no-N branch. The Python API therefore o
 
 FINEMAP and conditional analysis continue to require N. A factor equivalent N derived from GenomicSEM SE/MAF is not automatically substituted into the no-N analysis. Its applicability depends on factor scaling and the summary-statistics model.
 
+## PolyFun priors: pre-annotated SNPVAR and legacy prior-file
+
+Generate functional priors externally with official PolyFun [extract_snpvar.py at 569f852](https://github.com/omerwe/polyfun/blob/569f852680c9fa707dcdccb3092f0d1f90f1455a/extract_snpvar.py). It extracts precomputed per-SNP heritability from `snpvar_meta.chr1_7.parquet` / `snpvar_meta.chr8_22.parquet` and exports the `SNPVAR` column. EasyFinemap receives these values; it does not generate or estimate PolyFun priors.
+
+Merge **only `SNPVAR`** into the prepared EasyFinemap summary statistics by chromosome, position and unordered allele pair. Keep the original GWAS `EA`, `NEA`, `BETA` and `SE`: the extractor can reorder A1/A2 and flip Z, so those output columns must not silently replace GWAS effect directions. Use matching genome builds and verify every analyzed SNP has a prior.
+
+For pre-annotated input, supply a tab-separated file (plain TSV or TSV.gz without a tabix index) containing the usual EasyFinemap columns plus `SNPVAR`, and omit `--prior-file`:
+
+```bash
+easyfinemap fine-mapping gwas.with_snpvar.tsv loci.tsv leads.tsv results.tsv \
+  --methods polyfun_susie --ldref panel --max-causal 5 --credible-threshold 0.95
+```
+
+The existing `--prior-file` route remains supported: it reads an indexed tabix table with `snpvar_bin` and maps values to locus SNPs. Its query uses an explicit 1-based inclusive region so both boundary SNPs are included. An explicitly supplied prior file takes precedence over pre-annotated `SNPVAR`. Both routes reject missing, NA, nonfinite, zero or negative priors; missing matches are errors rather than zero-filled weights. `run_susie()` normalizes the retained locus values as `prior_weights = SNPVAR / sum(SNPVAR)` before passing them to official `susie_rss`. Direct API calls also recognize an existing `SNPVAR` column. The plain `susie` method remains a uniform-prior comparison when both methods use the same annotated input.
+
 ## Signed LD and alignment
 
 RSS requires a signed correlation matrix in the same variant order and effect-allele direction as Z. Squared LD is not a replacement for R. The [official diagnostic tutorial](https://stephenslab.github.io/susieR/articles/susierss_diagnostic.html) demonstrates the consequences of allele inconsistency.
@@ -47,3 +62,5 @@ The [HERMES README](https://github.com/ihi-comp-med/hermes2-gwas/blob/486fbcf9ac
 ## Validation scope
 
 Tests use real rpy2, official R functions in independent processes and PLINK, including no-N/supplied-N, nonuniform prior weights, signed-R allele-flip invariance, native overlap, filtered-effect coverage, zero CSs, nonconvergence and input errors. Full CLI trials use actual ResidualHF_CAD locus data, with exclusions recorded. Nonuniform synthetic weights verify API transmission; they are not actual PolyFun annotations. Full functional-prior generation, all 21 project loci, window/L sensitivity and empirical coverage calibration are separate analyses.
+
+Prior-input tests cover pre-annotated `polyfun_susie`, uniform `susie` on the same table, strict prior QC, legacy `snpvar_bin` mapping/precedence, and a full PLINK/CLI trial without `--prior-file`. Unit tests mock only tabix queries and panel extraction; SuSiE inference uses the real installed package.

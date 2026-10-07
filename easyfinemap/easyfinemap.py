@@ -420,10 +420,12 @@ class EasyFinemap(object):
         if not np.isfinite(susie_input[[ColName.BETA, ColName.SE]].to_numpy()).all() or (susie_input[ColName.SE] <= 0).any():
             raise ValueError("SuSiE requires finite BETA and strictly positive SE.")
         susie_input[ColName.Z] = susie_input[ColName.BETA] / susie_input[ColName.SE]
-        if prior_file:
+        if prior_file or 'SNPVAR' in susie_input:
+            if 'SNPVAR' not in susie_input or susie_input['SNPVAR'].isna().any():
+                raise ValueError("SNPVAR must be present, finite and strictly positive for every variant; no missing priors.")
             prior = susie_input['SNPVAR'].to_numpy(dtype=float)
-            if not np.isfinite(prior).all() or (prior < 0).any() or prior.sum() <= 0:
-                raise ValueError("SNPVAR must be finite, nonnegative and have positive total mass.")
+            if not np.isfinite(prior).all() or (prior <= 0).any() or not np.isfinite(prior.sum()):
+                raise ValueError("SNPVAR must be finite and strictly positive, with a finite total mass.")
             susie_input['SNPVAR'] = prior / prior.sum()
         else:
             susie_input['SNPVAR'] = 1 / len(susie_input)
@@ -760,13 +762,17 @@ class EasyFinemap(object):
         chrom = sumstats[ColName.CHR].unique()[0]
         start = sumstats[ColName.BP].min()
         end = sumstats[ColName.BP].max()
-        prior_df = pd.DataFrame(data=tb.query(str(chrom), start, end), columns=header)
+        # BP 为 1-based 闭区间；querys 显式保留首尾 SNP，避免 query 的坐标边界差异。
+        prior_df = pd.DataFrame(data=tb.querys(f"{chrom}:{start}-{end}"), columns=header)
         prior_df = prior_df.rename(columns={"snpvar_bin": "SNPVAR"})
         prior_df['SNPVAR'] = prior_df['SNPVAR'].astype(float)
         prior_df = sg.make_SNPID_unique(prior_df, ColName.CHR, ColName.BP, 'A1', 'A2')
         prior_df = prior_df.drop_duplicates(subset=ColName.SNPID)
         prior_map = prior_df[['SNPID', 'SNPVAR']].set_index('SNPID').to_dict()['SNPVAR']
-        sumstats['SNPVAR'] = sumstats[ColName.SNPID].map(prior_map).fillna(0)
+        sumstats['SNPVAR'] = sumstats[ColName.SNPID].map(prior_map)
+        prior = sumstats['SNPVAR'].to_numpy(dtype=float)
+        if not np.isfinite(prior).all() or (prior <= 0).any():
+            raise ValueError("SNPVAR must be finite and strictly positive for every variant; no missing priors.")
         return sumstats
 
     @io_in_tempdir('./tmp/easyfinemap')
@@ -865,6 +871,8 @@ class EasyFinemap(object):
         fm_input_ol = fm_input.copy()
         if prior_file:
             fm_input_ol = self.annotate_prior(fm_input_ol, prior_file)
+        if "polyfun_susie" in methods and 'SNPVAR' not in fm_input_ol:
+            raise ValueError("polyfun_susie requires pre-annotated SNPVAR or --prior-file.")
         if len(set(methods).intersection(set(methods_required_ld))) > 0:
             # TODO: reduce the number of SNPs when using paintor and caviarbf in multiple causal variant mode
             ld_ol = self.prepare_ld_matrix(
@@ -913,7 +921,7 @@ class EasyFinemap(object):
                 elif method == "susie":
                     if os.path.exists(ld_matrix):
                         susie_pp, susie_cs_members, susie_cs_summary = self.run_susie(
-                            sumstats=ld_ol,
+                            sumstats=ld_ol.drop(columns=['SNPVAR'], errors='ignore'),  # 均匀先验对照不使用功能权重。
                             ld_matrix=ld_matrix,
                             prior_file=None,
                             output_prefix=f"{output_prefix}.susie" if output_prefix else None,

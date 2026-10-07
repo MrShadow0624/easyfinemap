@@ -51,8 +51,11 @@ def test_matches_official_r(tmp_path, sample_size, weighted):
     d = pd.DataFrame({"SNPID": ["1-100-A-G", "1-200-C-T", "1-300-A-C"], "EA": ["A", "C", "A"],
                       "BETA": [5., -4., 4.5], "SE": [1., 1., 1.], "SNPVAR": [1., 3., 2.]})
     prefix = str(tmp_path / "fit")
-    pip, members, summary = EasyFinemap().run_susie(d, str(ld_file), sample_size=sample_size, max_causal=2,
-                         prior_file="preannotated" if weighted else None, return_native_cs=True, output_prefix=prefix)
+    susie_input = d if weighted else d.drop(columns='SNPVAR')
+    pip, members, summary = EasyFinemap().run_susie(susie_input, str(ld_file), sample_size=sample_size, max_causal=2,
+                         return_native_cs=True, output_prefix=prefix)
+    expected_weights = d.SNPVAR / d.SNPVAR.sum() if weighted else np.repeat(1 / len(d), len(d))
+    np.testing.assert_allclose(pd.read_csv(f"{prefix}.inputs.tsv", sep="\t").SNPVAR, expected_weights, atol=1e-15, rtol=0)
 
     # Step2. 在独立 R 进程直接调用官方函数，比较全部 PIP 与每个 CS 的成员和 alpha。
     n_clause = "" if sample_size is None else f"n={sample_size},"
@@ -210,3 +213,16 @@ def test_plink_signed_ld_and_cli(tmp_path):
     assert "SUSIE_EFFECT" in output and len(output) > 0
     status = pd.read_csv(f"{outfile}.loci/1_50_350.susie.locus_summary.tsv", sep="\t").iloc[0]
     assert status.converged and status.n_mode == "none_large_sample_small_effect"
+
+    # Step4. 同一真实 LD 面板试跑预注释 SNPVAR；不提供 prior-file 或 tabix 索引。
+    d['SNPVAR'] = [2., 3., 1.]
+    d.to_csv(tmp_path / "gwas.tsv", sep="\t", index=False)
+    weighted_outfile = tmp_path / "polyfun.tsv"
+    result = subprocess.run([sys.executable, "-m", "easyfinemap.cli", "fine-mapping", str(tmp_path / "gwas.tsv"),
+               str(tmp_path / "loci.tsv"), str(tmp_path / "lead.tsv"), str(weighted_outfile), "-m", "polyfun_susie", "--ldref", str(source),
+               "--max-causal", "2", "--credible-threshold", ".95", "--threads", "1"], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    weighted_input = pd.read_csv(f"{weighted_outfile}.loci/1_50_350.polyfun_susie.inputs.tsv", sep="\t")
+    expected = d.set_index('SNPID').SNPVAR / d.SNPVAR.sum()
+    np.testing.assert_allclose(weighted_input.SNPVAR, weighted_input.SNPID.map(expected), atol=1e-15, rtol=0)
+    assert "SUSIE_EFFECT" in pd.read_csv(weighted_outfile, sep="\t")
