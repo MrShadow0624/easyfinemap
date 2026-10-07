@@ -32,7 +32,6 @@ class LDRef:
         """Initialize the LDRef class."""
         self.logger = logging.getLogger("LDRef")
         self.plink = Tools().plink
-        self.gcta = Tools().gcta
         self.tmp_root = Path.cwd() / "tmp" / "ldref"
         if not self.tmp_root.exists():
             self.tmp_root.mkdir(parents=True)
@@ -334,16 +333,25 @@ class LDRef:
         if res.returncode != 0:
             self.logger.warning(res.stderr)
             self.logger.warning(f'see log file: {out_plink}.log for details')
-            # raise RuntimeError(res.stderr)
-            return pd.DataFrame()
+            raise RuntimeError(f"PLINK intersection failed: {res.stderr}; see {out_plink}.log")
         else:
             bim = pd.read_csv(
                 f"{out_plink}.bim",
                 delim_whitespace=True,
                 names=[ColName.CHR, ColName.RSID, "cM", ColName.BP, ColName.EA, ColName.NEA],
             )
-            overlap_sumstat = sumstats[sumstats[ColName.SNPID].isin(bim[ColName.RSID])].copy()
-            overlap_sumstat.reset_index(drop=True, inplace=True)
+            # Step1. 按实际输出 BIM 重排；无序 allele ID 不能代表效应方向。
+            if sumstats[ColName.SNPID].duplicated().any() or bim[ColName.RSID].duplicated().any():
+                raise ValueError("Duplicate SNP IDs in summary statistics or LD panel.")
+            overlap_sumstat = sumstats.set_index(ColName.SNPID).loc[bim[ColName.RSID]].reset_index()
+            overlap_sumstat.rename(columns={"index": ColName.SNPID}, inplace=True)
+            same = (overlap_sumstat[ColName.EA] == bim[ColName.EA]) & (overlap_sumstat[ColName.NEA] == bim[ColName.NEA])
+            swapped = (overlap_sumstat[ColName.EA] == bim[ColName.NEA]) & (overlap_sumstat[ColName.NEA] == bim[ColName.EA])
+            same_chr = np.array_equal(overlap_sumstat[ColName.CHR].astype(str), bim[ColName.CHR].astype(str))
+            if not (same | swapped).all() or not same_chr or not np.array_equal(overlap_sumstat[ColName.BP], bim[ColName.BP]):
+                raise ValueError("LD panel alleles or positions do not match summary statistics.")
+            overlap_sumstat["LD_A1"] = bim[ColName.EA].values
+            overlap_sumstat["LD_A2"] = bim[ColName.NEA].values
 
             if use_ref_EAF:
                 cmd = [
@@ -357,16 +365,12 @@ class LDRef:
                 res = run(cmd, stdout=PIPE, stderr=PIPE, universal_newlines=True)
                 self.logger.debug(f"calculate EAF of {out_plink}")
                 self.logger.debug(f"calculate EAF: {' '.join(cmd)}")
-                # if res.returncode != 0:
-                #     self.logger.error(res.stderr)
-                #     self.logger.error(f'see log file: {temp_dir}/freq.log for details')
-                #     raise RuntimeError(res.stderr)
+                if res.returncode != 0:
+                    raise RuntimeError(res.stderr)
                 freq = pd.read_csv(f"{temp_dir}/freq.frq", delim_whitespace=True)
-                freq['A2_frq'] = 1 - freq['MAF']
-                overlap_sumstat['EAF'] = freq['A2_frq'].where(
-                    freq['A2'] == overlap_sumstat['EA'], freq['MAF']
-                )
-                overlap_sumstat['MAF'] = freq['MAF']
+                freq = freq.set_index("SNP").loc[overlap_sumstat[ColName.SNPID]].reset_index()
+                overlap_sumstat[ColName.EAF] = np.where(freq["A1"] == overlap_sumstat[ColName.EA], freq["MAF"], 1 - freq["MAF"])
+                overlap_sumstat[ColName.MAF] = freq["MAF"].values
             return overlap_sumstat
 
     @io_in_tempdir('./tmp/ldref')
@@ -374,12 +378,13 @@ class LDRef:
         self,
         ldref: str,
         outprefix: str,
+        temp_dir: Optional[str] = None,
         **kwargs,
     ):
         """
         Make the LD matrix.
 
-        TODO: Calculate LD matrix using plink-pandas, because plink1.9 --ld contains bug.
+        Compute signed correlations after per-SNP mean imputation, preserving BIM A1 dosage order.
 
         Parameters
         ----------
@@ -397,30 +402,26 @@ class LDRef:
         -------
         None
         """
-        self.logger.info(f"Making LD matrix: {outprefix}")
-        cmd = [
-            self.plink,
-            "--bfile",
-            ldref,
-            "--r2",
-            "square",
-            "spaces",
-            "--threads",
-            "1",
-            "--out",
-            outprefix,
-        ]
+        # Step1. 导出 BIM A1 剂量；使用完整样本计算 signed r，不使用 r²。
+        self.logger.info(f"Making signed LD matrix: {outprefix}")
+        cmd = [self.plink, "--bfile", ldref, "--keep-allele-order", "--recode", "A", "--out", f"{temp_dir}/dosage"]
         res = run(cmd, stdout=PIPE, stderr=PIPE, universal_newlines=True)
-        self.logger.debug(f"get LD matrix: {' '.join(cmd)}")
         if res.returncode != 0:
-            self.logger.warning(res.stderr)
-            self.logger.warning(f'see log file: {outprefix}.log for details')
-        else:
-            self.logger.debug("LD matrix is made")
-            run(["sed", "-i", "s/nan/1e-6/g", f"{outprefix}.ld"])
-            # matrix = np.loadtxt(f"{outprefix}.ld")
-            # matrix[np.isnan(matrix)] = 1e-6
-            # np.savetxt(f"{outprefix}.ld", matrix)
+            raise RuntimeError(res.stderr)
+        bim = pd.read_csv(f"{ldref}.bim", sep=r"\s+", header=None, names=[ColName.CHR, ColName.SNPID, "CM", ColName.BP, "LD_A1", "LD_A2"])
+        raw = pd.read_csv(f"{temp_dir}/dosage.raw", sep=r"\s+")
+        if raw.columns[6:].tolist() != (bim[ColName.SNPID].astype(str) + "_" + bim["LD_A1"]).tolist():
+            raise ValueError("Genotype dosage columns do not match BIM SNPs and A1 alleles.")
+
+        # Step2. 均值填补缺失剂量，避免 pairwise 删除导致非半正定矩阵。
+        genotype = raw.iloc[:, 6:].to_numpy(dtype=float)
+        means = np.nanmean(genotype, axis=0)
+        genotype = np.where(np.isnan(genotype), means, genotype)
+        if genotype.shape[0] < 2 or not np.isfinite(genotype).all() or (np.var(genotype, axis=0) == 0).any():
+            raise ValueError("LD panel contains an all-missing or zero-variance variant; review input QC.")
+        matrix = np.atleast_2d(np.corrcoef(genotype, rowvar=False))
+        np.savetxt(f"{outprefix}.ld", matrix, fmt="%.16g")
+        bim.to_csv(f"{outprefix}.ld.snps.tsv", sep="\t", index=False)
 
     @io_in_tempdir('./tmp/ldref')
     def cojo_cond(
@@ -504,7 +505,7 @@ class LDRef:
             f.write('\n'.join(cond_snps[ColName.SNPID].tolist()))
         cojo_outfile = f"{temp_dir}/cojo_{chrom}.cond"
         cmd = [
-            self.gcta,
+            Tools().gcta,
             "--bfile",
             ldref,
             "--cojo-file",
@@ -532,7 +533,7 @@ class LDRef:
                     f"{temp_dir}/cojo_{chrom}.reslct.ma", sep=" ", index=False
                 )
                 cmd = [
-                    self.gcta,
+                    Tools().gcta,
                     "--bfile",
                     ldref,
                     "--cojo-file",
@@ -558,7 +559,7 @@ class LDRef:
                     with open(f"{temp_dir}/cojo_cond_{chrom}.snps", "w") as f:
                         f.write('\n'.join(new_conds))
                     cmd = [
-                        self.gcta,
+                        Tools().gcta,
                         "--bfile",
                         ldref,
                         "--cojo-file",

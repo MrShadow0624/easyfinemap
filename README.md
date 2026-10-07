@@ -39,7 +39,7 @@ A flexible framework for GWAS fine-mapping
 
 ## Fork-specific SuSiE-RSS behavior
 
-This fork adds two SuSiE-RSS compatibility changes for research workflows:
+This fork uses official susieR with explicit inputs and native CS outputs:
 
 1. `--sample-size` is optional for SuSiE-RSS. If omitted, the underlying
    `susieR::susie_rss()` call omits the `n` argument (the official no-N
@@ -49,6 +49,14 @@ This fork adds two SuSiE-RSS compatibility changes for research workflows:
    `susie_get_cs()` output (including coverage and LD-purity summaries),
    rather than being reconstructed by cumulatively summing marginal PIPs
    across a locus.
+3. LD uses signed dosage correlations, reordered to BIM and aligned to GWAS
+   effect alleles. Squared LD (`r²`) is not passed as the RSS correlation matrix.
+4. CLI runs retain each fit, all-variant PIP, native CS tables, diagnostics and
+   locus status under `<outfile>.loci/`, including loci without retained CSs.
+   Nonconverged fits raise an error after saving a checkpoint.
+
+For the project preset, pass `--max-causal 5 --credible-threshold 0.95
+--susie-min-abs-corr 0.5` explicitly; the CLI's L default remains 1.
 
 Implementation notes and references are documented in
 [`docs/susie_native_cs.md`](docs/susie_native_cs.md).

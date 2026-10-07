@@ -152,7 +152,7 @@ def fine_mapping(
         "--sample-size",
         "-n",
         help=(
-            "Sample size. Optional for SuSiE-RSS (omitted => n=NULL); "
+            "Sample size. Optional for SuSiE-RSS (omitted => official no-N mode); "
             "required for FINEMAP and conditional analysis."
         ),
     ),
@@ -175,11 +175,12 @@ def fine_mapping(
 ) -> None:
     """Fine mapping."""
     if os.path.exists(sumstats_path) and os.path.exists(loci_path) and os.path.exists(lead_snps_path):
-        # sumstats = pd.read_csv(sumstats_path, sep="\t")
+        # 已索引文件按区间读取；普通 TSV 先读取一次，避免每个 locus 重复读全文件。
+        sumstats = sumstats_path if os.path.exists(f"{sumstats_path}.tbi") else pd.read_csv(sumstats_path, sep="\t")
         loci = pd.read_csv(loci_path, sep="\t")
         lead_snps = pd.read_csv(lead_snps_path, sep="\t")
         EasyFinemap().finemap_all_loci(
-            sumstats=sumstats_path,
+            sumstats=sumstats,
             loci=loci,
             lead_snps=lead_snps,
             methods=methods,  # type: ignore

@@ -1,8 +1,6 @@
 """Tests for the loci module."""
 
 import os
-import shutil
-from pathlib import Path
 import pytest
 
 import pandas as pd
@@ -11,24 +9,16 @@ from easyfinemap.loci import Loci
 from easyfinemap.constant import ColName
 
 PWD = os.path.dirname(os.path.abspath(__file__))
-CWD = os.getcwd()
 
 
 class TestLoci:
     """Tests for the Loci class."""
 
-    def test_init(self):
+    def test_init(self, tmp_path, monkeypatch):
         """Test the Loci class."""
-        if os.path.exists(f"{CWD}/tmp/loci"):
-            shutil.rmtree(f"{CWD}/tmp/loci")
+        monkeypatch.chdir(tmp_path)  # 与真实分析和其他测试隔离。
         loci = Loci()
-        assert str(loci.tmp_root) == f"{CWD}/tmp/loci"
-        for file in Path(f"{PWD}/exampledata/").glob("*loci.txt"):
-            if file.is_file():
-                os.remove(file)
-        for file in Path(f"{PWD}/exampledata/").glob("*leadsnp.txt"):
-            if file.is_file():
-                os.remove(file)
+        assert loci.tmp_root == tmp_path / "tmp/loci"
 
     def test_identify_indep_loci(self, sumstats_data, clean_ld_panel):
         """Test the identify_indep_loci function."""

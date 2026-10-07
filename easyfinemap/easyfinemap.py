@@ -18,6 +18,7 @@ Perform fine-mapping for a locus using the following methods:
 
 import logging
 import os
+import shutil
 from pathlib import Path
 from subprocess import PIPE, run
 from typing import List, Optional, Tuple, Union
@@ -44,14 +45,7 @@ class EasyFinemap(object):
     def __init__(self):
         """Initialize."""
         self.logger = logging.getLogger('EasyFinemap')
-        tool = Tools()
-        self.finemap = tool.finemap
-        self.paintor = tool.paintor
-        self.gcta = tool.gcta
-        self.plink = tool.plink
-        self.bcftools = tool.bcftools
-        self.caviarbf = tool.caviarbf
-        self.model_search = tool.model_search
+        # 只在调用对应方法时检查外部程序，SuSiE 不依赖其他精细定位工具。
         self.tmp_root = Path.cwd() / "tmp" / "easyfinemap"
         if not self.tmp_root.exists():
             self.tmp_root.mkdir(parents=True)
@@ -208,7 +202,7 @@ class EasyFinemap(object):
             f.write("z;ld;snp;config;cred;log;n_samples\n")
             f.write(";".join(master_content))
         cmd = [
-            self.finemap,
+            Tools().finemap,
             "--sss",
             "--in-files",
             f"{temp_dir}/finemap.master",
@@ -278,7 +272,7 @@ class EasyFinemap(object):
             universal_newlines=True,
         )
         cmd = [
-            self.paintor,
+            Tools().paintor,
             "-input",
             f"{temp_dir}/{input_prefix}.input",
             "-out",
@@ -343,7 +337,7 @@ class EasyFinemap(object):
         )
         n_variants = caviar_input.shape[0]
         cmd = [
-            self.caviarbf,
+            Tools().caviarbf,
             "-z",
             f"{temp_dir}/caviar.input",
             "-r",
@@ -362,7 +356,7 @@ class EasyFinemap(object):
         self.logger.debug(f"run CAVIAR-BF: {' '.join(cmd)}")
         run(cmd, stdout=PIPE, stderr=PIPE, universal_newlines=True)
         cmd = [
-            self.model_search,
+            Tools().model_search,
             "-i",
             f"{temp_dir}/caviar.output",
             "-m",
@@ -394,8 +388,8 @@ class EasyFinemap(object):
         """
         if sample_size is None:
             return ""
-        if sample_size <= 0:
-            raise ValueError("sample_size must be positive or None for SuSiE-RSS.")
+        if not np.isfinite(sample_size) or round(sample_size) <= 1:
+            raise ValueError("sample_size must round to an integer greater than 1, or be None.")
         return f"n={int(round(sample_size))},"
 
     @io_in_tempdir('./tmp/easyfinemap')
@@ -408,200 +402,145 @@ class EasyFinemap(object):
         prior_file: Optional[str] = None,
         temp_dir: Optional[str] = None,
         return_native_cs: bool = False,
+        output_prefix: Optional[str] = None,
         **kwargs,
     ) -> Union[pd.Series, Tuple[pd.Series, pd.DataFrame, pd.DataFrame]]:
-        """Run SuSiE-RSS and optionally return native per-effect credible sets.
+        """Fit official SuSiE-RSS using signed LD; retain native effect-specific CSs.
 
-        Parameters
-        ----------
-        sumstats : pd.DataFrame
-            Summary statistics.
-        ld_matrix : str
-            Path to signed LD correlation matrix.
-        sample_size : Optional[int], optional
-            Sample size supplied to susie_rss. When omitted, the n argument
-            is omitted from the R call, activating SuSiE-RSS no-N mode. This
-            is equivalent in intent to n = NULL in newer optional-n interfaces
-            and is compatible with the fork's pinned susieR 0.12.35.
-        max_causal : int, optional
-            Maximum number of single effects (L), by default 1.
-        prior_file : Optional[str], optional
-            Path to PolyFun prior file, by default None.
-        return_native_cs : bool, optional
-            If True, also return SuSiE native per-effect credible-set
-            membership and credible-set summaries.
-
-        Notes
-        -----
-        SuSiE credible sets are defined from the effect-specific posterior
-        inclusion probabilities in res$alpha and returned by
-        susieR::susie_get_cs. They are not reconstructed by cumulatively
-        summing marginal PIPs across the whole locus.
-
-        This follows the SuSiE reference implementation and the HERMES2
-        PolyFun/SuSiE workflow, where PolyFun reads native susie_obj$sets
-        and propagates those memberships as CREDIBLE_SET.
-
-        References
-        ----------
-        SuSiE-RSS:
-        https://stephenslab.github.io/susieR/reference/susie_rss.html
-        susieR 0.12.35 no-N implementation used by EasyFinemap's environment:
-        https://github.com/stephenslab/susieR/blob/da24d5fba95845ad082b893f9c80b85b7523c6f6/R/susie_rss.R
-        SuSiE native credible sets:
-        https://github.com/stephenslab/susieR/blob/master/R/susie_get_functions.R
-        HERMES2 fine-mapping wrapper:
-        https://github.com/ihi-comp-med/hermes2-gwas/blob/486fbcf9ace1c09135bce982f6e6ad7ae67178b7/workflow/rules/scripts/finemap/run_polyfun_susie.py
-        PolyFun SuSiE credible-set extraction used by the HERMES workflow:
-        https://github.com/omerwe/polyfun/blob/7227ed5261ee0ed9ad1af1031419a2180099b953/finemapper.py
+        Omitting sample_size activates missing(n) in susieR 0.12.35. With
+        output_prefix, save the fit, all-variant PIP, CS tables and locus status.
+        The official algorithm is unchanged; achieved coverage is summed from
+        alpha to avoid the 0.12.35 coverage-index bug after purity filtering.
+        See docs/susie_native_cs.md for fixed-version official references.
         """
+        # Step1. 保留原 GWAS Z 方向，核对效应、先验和 signed LD 的 SNP 顺序。
         susie_input = sumstats.copy()
+        if susie_input.empty or susie_input[ColName.SNPID].isna().any() or susie_input[ColName.SNPID].duplicated().any():
+            raise ValueError("SuSiE requires nonempty, unique SNP IDs.")
+        if not np.isfinite(susie_input[[ColName.BETA, ColName.SE]].to_numpy()).all() or (susie_input[ColName.SE] <= 0).any():
+            raise ValueError("SuSiE requires finite BETA and strictly positive SE.")
         susie_input[ColName.Z] = susie_input[ColName.BETA] / susie_input[ColName.SE]
         if prior_file:
-            susie_input['SNPVAR'] = susie_input['SNPVAR'] / susie_input['SNPVAR'].sum()
+            prior = susie_input['SNPVAR'].to_numpy(dtype=float)
+            if not np.isfinite(prior).all() or (prior < 0).any() or prior.sum() <= 0:
+                raise ValueError("SNPVAR must be finite, nonnegative and have positive total mass.")
+            susie_input['SNPVAR'] = prior / prior.sum()
         else:
             susie_input['SNPVAR'] = 1 / len(susie_input)
+        if os.path.exists(f"{ld_matrix}.snps.tsv"):
+            ld_snps = pd.read_csv(f"{ld_matrix}.snps.tsv", sep="\t")
+            if ld_snps[ColName.SNPID].tolist() != susie_input[ColName.SNPID].tolist():
+                raise ValueError("LD SNP order does not match summary statistics.")
+            if ColName.EA in ld_snps and not np.array_equal(ld_snps[ColName.EA], susie_input[ColName.EA]):
+                raise ValueError("Signed LD alleles do not match GWAS effect alleles.")
 
+        # Step2. L 为单效应上限；coverage/purity 使用官方常用值，完整 CS 计算 purity。
         coverage = kwargs.get("credible_threshold")
-        if coverage is None:
-            coverage = 0.95
+        coverage = 0.95 if coverage is None else coverage
         min_abs_corr = kwargs.get("susie_min_abs_corr", 0.5)
-        if not 0 < coverage <= 1:
-            raise ValueError("credible_threshold must be in (0, 1].")
-        if not 0 <= min_abs_corr <= 1:
-            raise ValueError("susie_min_abs_corr must be in [0, 1].")
-
-        susie_input[[ColName.SNPID, ColName.Z, 'SNPVAR']].to_csv(
-            f"{temp_dir}/susie.input", sep=" ", index=False, header=True
-        )
-        self.logger.debug(
-            f"run SuSiE: {temp_dir}/susie.input, prior_file: {prior_file}, "
-            f"sample_size: {sample_size}, coverage: {coverage}, "
-            f"min_abs_corr: {min_abs_corr}"
-        )
-
-        import rpy2.robjects as ro
-        from rpy2.rinterface_lib.callbacks import logger as rpy2_logger
-
-        rpy2_logger.setLevel(logging.ERROR)
+        max_iter = kwargs.get("susie_max_iter", 200)  # 项目预设；官方 0.12.35 默认为 100。
+        tol = kwargs.get("susie_tol", 1e-3)  # 官方 0.12.35 默认收敛阈值。
+        if not 0 < coverage <= 1 or not 0 <= min_abs_corr <= 1:
+            raise ValueError("coverage must be in (0, 1], and min_abs_corr in [0, 1].")
+        if max_causal < 1 or int(max_causal) != max_causal or max_iter < 1 or int(max_iter) != max_iter or not np.isfinite(tol) or tol < 0:
+            raise ValueError("L/max_iter must be positive integers and tol finite and nonnegative.")
         n_clause = self._format_susie_n_clause(sample_size)
+        output_prefix = str(Path(output_prefix).resolve()) if output_prefix else None
+        if output_prefix:
+            Path(output_prefix).parent.mkdir(parents=True, exist_ok=True)
+            # 重跑不能让旧成功输出伪装成本次结果；失败只保留本次已写出的检查点。
+            for suffix in ('.fit.rds', '.variant_pip.tsv', '.cs_members.tsv', '.cs_summary.tsv', '.locus_summary.tsv', '.z_ld_diagnostic.tsv'):
+                Path(f"{output_prefix}{suffix}").unlink(missing_ok=True)
+            susie_input.to_csv(f"{output_prefix}.inputs.tsv", sep="\t", index=False)
+            if Path(ld_matrix).resolve() != Path(f"{output_prefix}.ld"):
+                shutil.copyfile(ld_matrix, f"{output_prefix}.ld")
+            if os.path.exists(f"{ld_matrix}.snps.tsv") and Path(f"{ld_matrix}.snps.tsv").resolve() != Path(f"{output_prefix}.ld.snps.tsv"):
+                shutil.copyfile(f"{ld_matrix}.snps.tsv", f"{output_prefix}.ld.snps.tsv")
+        susie_input[[ColName.SNPID, ColName.Z, 'SNPVAR']].to_csv(f"{temp_dir}/susie.input", sep="\t", index=False)
+        self.logger.info(f"SuSiE: {len(susie_input)} SNPs, N={sample_size}, L={max_causal}, coverage={coverage}, purity={min_abs_corr}")
 
-        ro.r(
-            f"""library('data.table')
-                ld = fread('{ld_matrix}', sep=' ', header=FALSE)
-                ld = as.matrix(ld)
-                df = fread('{temp_dir}/susie.input', sep=' ', header=TRUE)
-                z = df$Z
-                prior = df$SNPVAR
-                library('susieR')
-                res = susie_rss(
-                    z,
-                    ld,
-                    {n_clause}
-                    L={max_causal},
-                    prior_weights=prior,
-                    coverage={coverage},
-                    min_abs_corr={min_abs_corr}
-                )
-                pip = res$pip
+        # Step3. 用真实 rpy2 调用官方算法；路径作为 R 对象传入，避免引号或空格改变代码。
+        import rpy2.robjects as ro
+        ro.globalenv['susie_input_file'] = ro.StrVector([str(Path(temp_dir, 'susie.input').resolve())])
+        ro.globalenv['susie_ld_file'] = ro.StrVector([str(Path(ld_matrix).resolve())])
+        ro.globalenv['susie_output_prefix'] = ro.StrVector([output_prefix or str(Path(temp_dir, 'susie').resolve())])
+        ro.globalenv['susie_cs_prefix'] = ro.StrVector([str(Path(temp_dir, 'susie').resolve())])
+        ro.r(f"""
+            suppressPackageStartupMessages({{
+                library(data.table)
+                library(susieR)
+            }})
+            ld = as.matrix(fread(susie_ld_file, header=FALSE))
+            df = fread(susie_input_file)
+            stopifnot(nrow(ld) == nrow(df), ncol(ld) == nrow(df), all(is.finite(ld)),
+                      max(abs(ld - t(ld))) < 1e-8, max(abs(diag(ld) - 1)) < 1e-8, max(abs(ld)) <= 1 + 1e-8)
+            eig = eigen(ld, symmetric=TRUE)
+            if (min(eig$values) < -1e-8) stop('Signed LD is not positive semidefinite; review input genotypes.')
+            attr(ld, 'eigen') = eig
+            s_diagnostic = estimate_s_rss(z=df$Z, R=ld, {n_clause} method='null-mle')
+            diagnostic = as.data.table(kriging_rss(z=df$Z, R=ld, {n_clause} s=s_diagnostic)$conditional_dist)
+            diagnostic[, SNPID := df$SNPID]
+            diagnostic[, allele_review := is.finite(logLR) & logLR > 2 & abs(df$Z) > 2]
+            fwrite(diagnostic, paste0(susie_output_prefix, '.z_ld_diagnostic.tsv'), sep='\\t')
+            res = susie_rss(z=df$Z, R=ld, {n_clause} L={int(max_causal)}, prior_weights=df$SNPVAR,
+                            estimate_residual_variance=FALSE, coverage={coverage}, min_abs_corr={min_abs_corr},
+                            n_purity=nrow(df), max_iter={int(max_iter)}, tol={tol})
+            saveRDS(res, paste0(susie_output_prefix, '.fit.rds'))
+            locus_summary = data.table(n_snps=nrow(df), L=nrow(res$alpha), n_iter=res$niter, converged=res$converged,
+                                       n_mode={'"none_large_sample_small_effect"' if sample_size is None else '"supplied"'},
+                                       sample_size={'NA_real_' if sample_size is None else int(round(sample_size))},
+                                       coverage_target={coverage}, purity_threshold={min_abs_corr}, n_purity=nrow(df),
+                                       residual_variance=res$sigma2, max_iter={int(max_iter)}, tol={tol},
+                                       s_diagnostic=s_diagnostic, n_allele_review=sum(diagnostic$allele_review),
+                                       review_required=s_diagnostic > 0.2 || any(diagnostic$allele_review),
+                                       susieR_version=as.character(packageVersion('susieR')))
+            fwrite(locus_summary, paste0(susie_output_prefix, '.locus_summary.tsv'), sep='\\t')
+            if (!isTRUE(res$converged)) stop('SuSiE-RSS did not converge; fit and status were saved.')
 
-                sets = susie_get_cs(
-                    res,
-                    Xcorr=ld,
-                    coverage={coverage},
-                    min_abs_corr={min_abs_corr}
-                )
-
-                cs_members = data.table(
-                    SNPID=character(),
-                    SUSIE_EFFECT=integer(),
-                    SUSIE_CS=character(),
-                    SUSIE_ALPHA=numeric(),
-                    SUSIE_CUM_ALPHA=numeric()
-                )
-                cs_summary = data.table(
-                    SUSIE_EFFECT=integer(),
-                    SUSIE_CS=character(),
-                    SUSIE_COVERAGE=numeric(),
-                    SUSIE_CS_SIZE=integer(),
-                    SUSIE_MIN_ABS_CORR=numeric(),
-                    SUSIE_MEAN_ABS_CORR=numeric(),
-                    SUSIE_MEDIAN_ABS_CORR=numeric()
-                )
-
-                if (!is.null(sets$cs)) {{
-                    for (k in seq_along(sets$cs)) {{
-                        idx = sets$cs[[k]]
-                        effect_idx = if (!is.null(sets$cs_index)) sets$cs_index[[k]] else k
-                        alpha_values = res$alpha[effect_idx, idx]
-                        ord = order(alpha_values, decreasing=TRUE)
-                        idx = idx[ord]
-                        alpha_values = alpha_values[ord]
-
-                        cs_name = names(sets$cs)[k]
-                        if (is.null(cs_name) || is.na(cs_name) || cs_name == "") {{
-                            cs_name = paste0("L", effect_idx)
-                        }}
-
-                        cs_members = rbind(
-                            cs_members,
-                            data.table(
-                                SNPID=df$SNPID[idx],
-                                SUSIE_EFFECT=as.integer(effect_idx),
-                                SUSIE_CS=cs_name,
-                                SUSIE_ALPHA=as.numeric(alpha_values),
-                                SUSIE_CUM_ALPHA=cumsum(as.numeric(alpha_values))
-                            )
-                        )
-
-                        purity_vals = c(NA_real_, NA_real_, NA_real_)
-                        if (!is.null(sets$purity) && nrow(sets$purity) >= k) {{
-                            purity_vals = as.numeric(sets$purity[k, 1:3])
-                        }}
-                        claimed_coverage = if (!is.null(sets$coverage)) {{
-                            as.numeric(sets$coverage[[k]])
-                        }} else {{
-                            sum(alpha_values)
-                        }}
-
-                        cs_summary = rbind(
-                            cs_summary,
-                            data.table(
-                                SUSIE_EFFECT=as.integer(effect_idx),
-                                SUSIE_CS=cs_name,
-                                SUSIE_COVERAGE=claimed_coverage,
-                                SUSIE_CS_SIZE=length(idx),
-                                SUSIE_MIN_ABS_CORR=purity_vals[1],
-                                SUSIE_MEAN_ABS_CORR=purity_vals[2],
-                                SUSIE_MEDIAN_ABS_CORR=purity_vals[3]
-                            )
-                        )
-                    }}
+            # Step4. CS 来源为官方 alpha/效应索引；边际 PIP 独立保存，不定义 CS coverage。
+            pip = susie_get_pip(res)
+            stopifnot(length(pip) == nrow(df), all(is.finite(pip)), all(pip >= 0 & pip <= 1))
+            sets = susie_get_cs(res, Xcorr=ld, coverage={coverage}, min_abs_corr={min_abs_corr}, n_purity=nrow(df))
+            cs_members = data.table(SNPID=character(), SUSIE_EFFECT=integer(), SUSIE_CS=character(),
+                                    SUSIE_ALPHA=numeric(), SUSIE_CUM_ALPHA=numeric())
+            cs_summary = data.table(SUSIE_EFFECT=integer(), SUSIE_CS=character(), SUSIE_COVERAGE=numeric(),
+                                    SUSIE_CS_SIZE=integer(), SUSIE_MIN_ABS_CORR=numeric(),
+                                    SUSIE_MEAN_ABS_CORR=numeric(), SUSIE_MEDIAN_ABS_CORR=numeric())
+            if (!is.null(sets$cs)) {{
+                for (k in seq_along(sets$cs)) {{
+                    idx = sets$cs[[k]]
+                    effect_idx = sets$cs_index[k]
+                    idx = idx[order(res$alpha[effect_idx, idx], decreasing=TRUE)]
+                    alpha_values = res$alpha[effect_idx, idx]
+                    cs_name = names(sets$cs)[k]
+                    cs_members = rbind(cs_members, data.table(SNPID=df$SNPID[idx], SUSIE_EFFECT=as.integer(effect_idx),
+                                                              SUSIE_CS=cs_name, SUSIE_ALPHA=as.numeric(alpha_values),
+                                                              SUSIE_CUM_ALPHA=cumsum(as.numeric(alpha_values))))
+                    # 0.12.35 的 sets$coverage 在 purity 筛选后可能错位，按当前效应成员重新求和。
+                    cs_summary = rbind(cs_summary, data.table(SUSIE_EFFECT=as.integer(effect_idx), SUSIE_CS=cs_name,
+                                       SUSIE_COVERAGE=sum(alpha_values), SUSIE_CS_SIZE=length(idx),
+                                       SUSIE_MIN_ABS_CORR=sets$purity$min.abs.corr[k],
+                                       SUSIE_MEAN_ABS_CORR=sets$purity$mean.abs.corr[k],
+                                       SUSIE_MEDIAN_ABS_CORR=sets$purity$median.abs.corr[k]))
                 }}
+                sets$coverage = cs_summary$SUSIE_COVERAGE
+            }}
+            res$sets = sets
+            saveRDS(res, paste0(susie_output_prefix, '.fit.rds'))
+            fwrite(cs_members, paste0(susie_cs_prefix, '.cs_members.tsv'), sep='\\t')
+            fwrite(cs_summary, paste0(susie_cs_prefix, '.cs_summary.tsv'), sep='\\t')
+            fwrite(cs_members, paste0(susie_output_prefix, '.cs_members.tsv'), sep='\\t')
+            fwrite(cs_summary, paste0(susie_output_prefix, '.cs_summary.tsv'), sep='\\t')
+            df[, PIP := as.numeric(pip)]
+            fwrite(df, paste0(susie_output_prefix, '.variant_pip.tsv'), sep='\\t')
+            locus_summary[, `:=`(n_credible_sets=length(sets$cs), n_variants_in_cs=uniqueN(cs_members$SNPID), max_pip=max(pip))]
+            fwrite(locus_summary, paste0(susie_output_prefix, '.locus_summary.tsv'), sep='\\t')
+        """)
 
-                fwrite(
-                    cs_members,
-                    '{temp_dir}/susie.cs_members.tsv',
-                    sep='\\t',
-                    quote=FALSE
-                )
-                fwrite(
-                    cs_summary,
-                    '{temp_dir}/susie.cs_summary.tsv',
-                    sep='\\t',
-                    quote=FALSE
-                )"""
-        )
-
-        susie_input['pip'] = ro.r('pip')
-        susie_res = pd.Series(
-            susie_input['pip'].values,
-            index=susie_input[ColName.SNPID].tolist(),
-        )
-
+        # Step5. 按 SNP 位置读取；长表保留同一 SNP 属于多个效应的成员身份。
+        susie_res = pd.Series(np.asarray(ro.r('pip')), index=susie_input[ColName.SNPID].tolist())
         if not return_native_cs:
             return susie_res
-
         cs_members = pd.read_csv(f"{temp_dir}/susie.cs_members.tsv", sep="\t")
         cs_summary = pd.read_csv(f"{temp_dir}/susie.cs_summary.tsv", sep="\t")
         return susie_res, cs_members, cs_summary
@@ -714,6 +653,12 @@ class EasyFinemap(object):
         ld = LDRef()
         sumstats_ol = ld.intersect(sumstats, ldref, outprefix, use_ref_EAF)
         ld.make_ld(outprefix, outprefix)
+        # 将 BIM A1 方向的 R 转到 GWAS EA；beta/Z 保持原方向。
+        matrix = np.loadtxt(f"{outprefix}.ld", ndmin=2)
+        sign = np.where(sumstats_ol[ColName.EA] == sumstats_ol["LD_A1"], 1, -1)
+        matrix = matrix * np.outer(sign, sign)
+        np.savetxt(f"{outprefix}.ld", matrix, fmt="%.16g")
+        sumstats_ol[[ColName.SNPID, ColName.EA, ColName.NEA, "LD_A1", "LD_A2"]].to_csv(f"{outprefix}.ld.snps.tsv", sep="\t", index=False)
         return sumstats_ol
 
     def get_credset(
@@ -777,16 +722,8 @@ class EasyFinemap(object):
         in more than one effect-specific credible set, so duplicate SNP rows are
         preserved when that occurs.
         """
-        if cs_members.empty:
-            return finemap_res.iloc[0:0].copy()
-
         out = finemap_res.merge(cs_members, on=ColName.SNPID, how="inner")
-        if not cs_summary.empty:
-            out = out.merge(
-                cs_summary,
-                on=["SUSIE_EFFECT", "SUSIE_CS"],
-                how="left",
-            )
+        out = out.merge(cs_summary, on=["SUSIE_EFFECT", "SUSIE_CS"], how="left")
         return out.reset_index(drop=True)
 
     def annotate_prior(
@@ -874,21 +811,18 @@ class EasyFinemap(object):
         pd.DataFrame
             Finemapping results.
         """
-        locus_sumstats = sg.export_sumstats(sumstats, chrom, start, end)
+        if isinstance(sumstats, pd.DataFrame):
+            locus_sumstats = sumstats[(sumstats[ColName.CHR].astype(str) == str(chrom)) & sumstats[ColName.BP].between(start, end)].copy()
+        else:
+            locus_sumstats = sg.export_sumstats(sumstats, chrom, start, end)
+        output_prefix = kwargs.pop("output_prefix", None)
         locus_sumstats = sg.make_SNPID_unique(
             locus_sumstats, ColName.CHR, ColName.BP, ColName.EA, ColName.NEA
         )
-        locus_sumstats = locus_sumstats.replace(np.inf, 100)
-        locus_sumstats = locus_sumstats.replace(-np.inf, -100)
+        # 非有限效应应由输入 QC 明确处理，不能把 inf 静默改成任意 beta/SE。
         self.logger.info(f"Finemap {chrom}:{start}-{end}")
         self.logger.info(f"Number of SNPs: {locus_sumstats.shape[0]}")
-        if len(locus_sumstats) > 5000:
-            self.logger.warning(
-                "The number of SNPs is greater than 5000, reduce the number of SNPs to 5000"
-            )
-            locus_sumstats = locus_sumstats[
-                locus_sumstats[ColName.P] < locus_sumstats[ColName.P].nsmallest(5000).iloc[-1]
-            ].copy()
+        # 精细定位保留完整区间，不能按 P 值截取 5000 个 SNP。
         if conditional:
             cond_res = self.cond_sumstat(sumstats=locus_sumstats, lead_snp=lead_snp, **kwargs)
             fm_input = cond_res.copy()
@@ -982,6 +916,7 @@ class EasyFinemap(object):
                             sumstats=ld_ol,
                             ld_matrix=ld_matrix,
                             prior_file=None,
+                            output_prefix=f"{output_prefix}.susie" if output_prefix else None,
                             return_native_cs=True,
                             **kwargs,
                         )
@@ -1007,6 +942,7 @@ class EasyFinemap(object):
                             sumstats=ld_ol,
                             ld_matrix=ld_matrix,
                             prior_file=prior_file,
+                            output_prefix=f"{output_prefix}.polyfun_susie" if output_prefix else None,
                             return_native_cs=True,
                             **kwargs,
                         )
@@ -1122,6 +1058,9 @@ class EasyFinemap(object):
         threads : int, optional
             Number of threads, by default 1
         """
+        needs_n = conditional or bool(set(methods) & {"all", "finemap", "polyfun_finemap"})
+        if needs_n and (sample_size is None or not np.isfinite(sample_size) or sample_size <= 1):
+            raise ValueError("FINEMAP and conditional analysis require sample_size greater than 1.")
         # sumstats = sg.make_SNPID_unique(sumstats, ColName.CHR, ColName.BP, ColName.EA, ColName.NEA)
         if (
             credible_threshold
@@ -1153,6 +1092,7 @@ class EasyFinemap(object):
                 "credible_method": credible_method,
                 "susie_min_abs_corr": susie_min_abs_corr,
                 "use_ref_EAF": use_ref_EAF,
+                "output_prefix": str(Path(f"{outfile}.loci") / f"{chrom}_{start}_{end}") if outfile else None,
             }
             kwargs_list.append(kwargs)
         ef = EasyFinemap()

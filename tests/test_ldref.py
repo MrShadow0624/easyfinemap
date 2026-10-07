@@ -1,7 +1,6 @@
 """Tests for the ldref module."""
 
 import os
-import shutil
 
 import pandas as pd
 import pytest
@@ -10,18 +9,16 @@ from easyfinemap.ldref import LDRef
 from easyfinemap.constant import ColName
 
 PWD = os.path.dirname(os.path.abspath(__file__))
-CWD = os.getcwd()
 
 
 class TestLDRef:
     """Tests for the LDRef class."""
 
-    def test_init(self):
+    def test_init(self, tmp_path, monkeypatch):
         """Test the initialization of the LDRef class."""
-        if os.path.exists(f"{CWD}/tmp"):
-            shutil.rmtree(f"{CWD}/tmp")
+        monkeypatch.chdir(tmp_path)  # 不删除当前项目共享的 tmp/。
         ldref = LDRef()
-        assert str(ldref.tmp_root) == f"{CWD}/tmp/ldref"
+        assert ldref.tmp_root == tmp_path / "tmp/ldref"
 
     def test_valid(self, dirty_ld_panel, clean_ld_panel):
         """Test the valid method of the LDRef class."""

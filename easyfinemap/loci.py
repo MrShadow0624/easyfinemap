@@ -33,7 +33,6 @@ class Loci:
         """Initialize the Loci class."""
         self.logger = logging.getLogger("Loci")
         self.plink = Tools().plink
-        self.gcta = Tools().gcta
         self.tmp_root = Path.cwd() / "tmp" / "loci"
         if not self.tmp_root.exists():
             self.tmp_root.mkdir(parents=True)
@@ -526,7 +525,7 @@ class Loci:
             cojo_input.to_csv(cojo_p_file, sep=" ", index=False)
             cojo_outfile = f"{temp_dir}/cojo_{chrom}.slct"
             cmd = [
-                self.gcta,
+                Tools().gcta,
                 "--bfile",
                 f"{temp_dir}/cojo_input_{chrom}",
                 "--cojo-file",
